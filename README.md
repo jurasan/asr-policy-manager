@@ -59,9 +59,22 @@ patterns as threats.
 
 - `Up` / `Down` or `j` / `k`: move
 - `Space`: select or clear a red blocked path
-- `Enter` or `a`: add selected exclusions
+- `Left` / `Right` (or `h` / `l`, `-` / `+`): widen the exclusion to the
+  containing folder, then its parent, and so on; narrow it back again
+- `Enter` or `a`: review and add the selected exclusions
 - `r`: refresh
 - `q` / `Esc`: quit
+
+## Excluding a folder instead of a file
+
+Each row starts as an exact file exclusion. Press `Left` to widen it one folder
+level at a time; the part of the path that will be excluded is underlined and
+the rest is dimmed, and the Pick column shows `^1`, `^2`, ... for the number of
+levels. Folder targets are written with a trailing backslash (for example
+`C:\Tools\`), which Defender requires to treat the entry as a folder rather than
+a file name. The drive root is never offered. Several rows widened to the same
+folder are added once. The confirmation dialog lists exactly which paths will be
+written before anything changes.
 
 ## Legacy script
 

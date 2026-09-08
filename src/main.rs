@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io::{self, Write},
     process::{Command, Stdio},
     time::Duration,
@@ -50,6 +50,12 @@ struct BlockedItem {
     rule: String,
     occurrences: usize,
     excluded_now: bool,
+    /// The normalized exclusion entry (file or folder) that currently covers
+    /// this path, when one does.
+    excluded_by: Option<String>,
+    /// How many trailing path components are dropped to form the exclusion
+    /// target: 0 = the file itself, 1 = its folder, 2 = the parent of that, ...
+    scope: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,13 +90,16 @@ impl App {
                 continue;
             }
 
+            let excluded_by = matching_exclusion(&path, &exclusions);
             let item = BlockedItem {
                 time: event.time,
                 path: path.clone(),
                 process: event.process.unwrap_or_else(|| "<not recorded>".to_owned()),
                 rule: event.rule.unwrap_or_else(|| "<not recorded>".to_owned()),
                 occurrences: 1,
-                excluded_now: is_excluded(&path, &exclusions),
+                excluded_now: excluded_by.is_some(),
+                excluded_by,
+                scope: 0,
             };
 
             match grouped.get_mut(&path) {
@@ -114,7 +123,10 @@ impl App {
         let status = if items.is_empty() {
             "No recent ASR block events were found.".to_owned()
         } else {
-            format!("{} unique blocked paths. Space selects; Enter applies; r refreshes; q quits.", items.len())
+            format!(
+                "{} unique blocked paths. Space selects; Left/Right widen/narrow to a folder; Enter applies; r refreshes; q quits.",
+                items.len()
+            )
         };
 
         Ok(Self {
@@ -141,21 +153,78 @@ impl App {
         }
 
         let path = item.path.clone();
-        if !self.checked.insert(path.clone()) {
+        let target = exclusion_target(&path, item.scope);
+        if self.checked.insert(path.clone()) {
+            self.status = format!("Selected. Will exclude {target}");
+        } else {
             self.checked.remove(&path);
+            self.status = "Selection cleared.".to_owned();
         }
     }
 
+    /// Moves the exclusion target of the highlighted row up the folder tree
+    /// (positive `delta`) or back down towards the file (negative `delta`).
+    fn adjust_scope(&mut self, delta: isize) {
+        let Some(item) = self.items.get_mut(self.selected) else {
+            return;
+        };
+        if item.excluded_now {
+            self.status = "That path is already excluded.".to_owned();
+            return;
+        }
+
+        let max = max_scope(&item.path) as isize;
+        let new_scope = (item.scope as isize + delta).clamp(0, max) as usize;
+        if new_scope == item.scope {
+            self.status = if delta > 0 {
+                "Cannot widen further: the drive root is never offered as an exclusion.".to_owned()
+            } else {
+                "Already at the exact file.".to_owned()
+            };
+            return;
+        }
+
+        item.scope = new_scope;
+        let target = exclusion_target(&item.path, item.scope);
+        let is_checked = self.checked.contains(&item.path);
+        self.status = if is_checked {
+            format!("Selected. Will exclude {target}")
+        } else {
+            format!("Will exclude {target} (press Space to select)")
+        };
+    }
+
+    /// The distinct paths that would be added, honoring each row's scope.
+    /// Several rows widened to the same folder collapse into one entry.
     fn selected_paths(&self) -> Vec<String> {
-        self.checked.iter().cloned().collect()
+        let mut targets = self
+            .items
+            .iter()
+            .filter(|item| self.checked.contains(&item.path))
+            .map(|item| exclusion_target(&item.path, item.scope))
+            .collect::<Vec<_>>();
+        targets.sort_by_key(|target| target.to_ascii_lowercase());
+        targets.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        targets
     }
 
     fn refresh(&mut self) -> Result<()> {
         let previously_checked = self.checked.clone();
+        let previous_scopes = self
+            .items
+            .iter()
+            .map(|item| (item.path.clone(), item.scope))
+            .collect::<HashMap<_, _>>();
+
         let refreshed = Self::load()?;
         self.items = refreshed.items;
         self.policy_enabled = refreshed.policy_enabled;
         self.selected = self.selected.min(self.items.len().saturating_sub(1));
+        for item in &mut self.items {
+            if let Some(scope) = previous_scopes.get(&item.path) {
+                item.scope = (*scope).min(max_scope(&item.path));
+            }
+        }
         self.checked = previously_checked
             .into_iter()
             .filter(|path| self.items.iter().any(|item| &item.path == path && !item.excluded_now))
@@ -346,6 +415,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                     app.selected = app.selected.saturating_sub(1);
                 }
                 KeyCode::Char(' ') => app.toggle_selected(),
+                KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('-') => app.adjust_scope(1),
+                KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('+') => app.adjust_scope(-1),
                 KeyCode::Char('r') => {
                     if let Err(error) = app.refresh() {
                         app.status = format!("Refresh failed: {error:#}");
@@ -354,10 +425,10 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                 KeyCode::Enter | KeyCode::Char('a') => {
                     if app.checked.is_empty() {
                         app.status = "Select at least one red [X] item first.".to_owned();
-                    } else if app.policy_enabled {
-                        app.mode = Mode::ConfirmApply;
                     } else {
-                        apply_with_status(app);
+                        // Always confirm: the dialog lists the exact paths, which
+                        // matters once rows have been widened to folders.
+                        app.mode = Mode::ConfirmApply;
                     }
                 }
                 _ => {}
@@ -412,11 +483,43 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
         let selected = app.checked.contains(&item.path);
         let status = if item.excluded_now { "[OK] Excluded" } else { "[X] Blocked" };
         let color = if item.excluded_now { Color::Green } else { Color::Red };
+
+        // The scope marker only matters while the row can still be selected.
+        let pick = match (selected, item.scope, item.excluded_now) {
+            (true, 0, _) | (true, _, true) => "[x]".to_owned(),
+            (true, scope, false) => format!("[x] ^{scope}"),
+            (false, 0, _) | (false, _, true) => "[ ]".to_owned(),
+            (false, scope, false) => format!("[ ] ^{scope}"),
+        };
+
+        // Split the path so the part that is (or will be) the exclusion is
+        // underlined and the remainder dimmed. For blocked rows that is the
+        // chosen scope; for excluded rows it is the folder entry covering them.
+        let split_at = if item.excluded_now {
+            item.excluded_by
+                .as_deref()
+                .and_then(|entry| covered_prefix_len(&item.path, entry))
+        } else if item.scope > 0 {
+            Some(exclusion_target(&item.path, item.scope).len())
+        } else {
+            None
+        };
+        let path_cell = match split_at {
+            Some(at) if at < item.path.len() => Cell::from(Line::from(vec![
+                Span::styled(
+                    item.path[..at].to_owned(),
+                    Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                ),
+                Span::styled(item.path[at..].to_owned(), Style::default().fg(Color::DarkGray)),
+            ])),
+            _ => Cell::from(item.path.clone()),
+        };
+
         Row::new(vec![
-            Cell::from(if selected { "[x]" } else { "[ ]" }),
+            Cell::from(pick),
             Cell::from(status),
             Cell::from(item.time.clone()),
-            Cell::from(item.path.clone()),
+            path_cell,
             Cell::from(item.process.clone()),
             Cell::from(item.occurrences.to_string()),
         ])
@@ -426,7 +529,7 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(6),
+            Constraint::Length(8),
             Constraint::Length(15),
             Constraint::Length(21),
             Constraint::Percentage(48),
@@ -450,11 +553,30 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
         Style::default().fg(Color::Yellow),
     ))];
     if let Some(item) = app.selected_item() {
+        let (label, target) = match item.excluded_by.as_deref() {
+            Some(entry) => {
+                // Show the covering entry in the path's own casing when possible.
+                let shown = match covered_prefix_len(&item.path, entry) {
+                    Some(at) => item.path[..at].to_owned(),
+                    None if normalize_path(&item.path) == entry => item.path.clone(),
+                    None => entry.to_owned(),
+                };
+                ("  Excluded by ".to_owned(), shown)
+            }
+            None => {
+                let scope_label = match item.scope {
+                    0 => "file".to_owned(),
+                    1 => "folder".to_owned(),
+                    n => format!("folder, {n} levels up"),
+                };
+                (format!("  Exclude ({scope_label}) "), exclusion_target(&item.path, item.scope))
+            }
+        };
         lines.push(Line::from(vec![
             Span::styled("Rule ", Style::default().fg(Color::DarkGray)),
             Span::raw(item.rule.clone()),
-            Span::styled("  Path ", Style::default().fg(Color::DarkGray)),
-            Span::raw(item.path.clone()),
+            Span::styled(label, Style::default().fg(Color::DarkGray)),
+            Span::styled(target, Style::default().add_modifier(Modifier::BOLD)),
         ]));
     }
     let status = Paragraph::new(lines)
@@ -463,13 +585,33 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
     frame.render_widget(status, layout[1]);
 
     if app.mode == Mode::ConfirmApply {
-        let popup = centered_rect(70, 45, frame.area());
+        let popup = centered_rect(80, 60, frame.area());
         frame.render_widget(Clear, popup);
-        let message = "Group Policy currently manages ASR exclusions on this computer.\n\nThe selected paths will be added to that policy list (the same registry location gpedit writes) and to local Defender preferences. If a domain or Intune policy refresh rewrites the list, entries added here may be removed.\n\nApply the selected exclusions?\n\nEnter/Y = apply    Esc/N = cancel";
+
+        const MAX_LISTED: usize = 10;
+        let targets = app.selected_paths();
+        let mut message = String::new();
+        if app.policy_enabled {
+            message.push_str(
+                "Group Policy currently manages ASR exclusions on this computer. The paths below will be added to that policy list (the same registry location gpedit writes) and to local Defender preferences. A domain or Intune policy refresh may remove them again.\n\n",
+            );
+        }
+        message.push_str(&format!("{} path(s) will be excluded from ASR:\n", targets.len()));
+        for target in targets.iter().take(MAX_LISTED) {
+            message.push_str("  ");
+            message.push_str(target);
+            message.push('\n');
+        }
+        if targets.len() > MAX_LISTED {
+            message.push_str(&format!("  ... and {} more\n", targets.len() - MAX_LISTED));
+        }
+        message.push_str("\nEnter/Y = apply    Esc/N = cancel");
+
+        let title = if app.policy_enabled { " Confirm policy override " } else { " Confirm exclusions " };
         let dialog = Paragraph::new(message)
-            .block(Block::default().borders(Borders::ALL).title(" Confirm policy override "))
+            .block(Block::default().borders(Borders::ALL).title(title))
             .style(Style::default().fg(Color::Yellow).bg(Color::Black))
-            .wrap(Wrap { trim: true });
+            .wrap(Wrap { trim: false });
         frame.render_widget(dialog, popup);
     }
 }
@@ -659,7 +801,113 @@ fn normalize_path(path: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn is_excluded(path: &str, exclusions: &[String]) -> bool {
+/// Returns the normalized exclusion entry that covers `path`, preferring the
+/// most specific (longest) match when several apply.
+fn matching_exclusion(path: &str, exclusions: &[String]) -> Option<String> {
     let path = normalize_path(path);
-    exclusions.iter().any(|entry| path == *entry || path.starts_with(&format!("{entry}\\")))
+    exclusions
+        .iter()
+        .filter(|entry| !entry.is_empty())
+        .filter(|entry| path == **entry || path.starts_with(&format!("{entry}\\")))
+        .max_by_key(|entry| entry.len())
+        .cloned()
+}
+
+/// Byte length of the leading part of `path` that a folder exclusion covers,
+/// including the separator after the folder. `None` when the entry is the file
+/// itself or the prefix cannot be mapped back onto the displayed path.
+fn covered_prefix_len(path: &str, entry: &str) -> Option<usize> {
+    let normalized = normalize_path(path);
+    if normalized == entry || normalized.len() != path.trim().len() {
+        return None;
+    }
+    let len = entry.len() + 1;
+    (len < path.len() && path.is_char_boundary(len)).then_some(len)
+}
+
+/// How far the exclusion target may move up from the file. The drive (or UNC
+/// server and share) plus at least one folder always remain, so `C:\` itself is
+/// never offered as an exclusion.
+fn max_scope(path: &str) -> usize {
+    let components = path.split(['\\', '/']).filter(|part| !part.is_empty()).count();
+    let reserved = if path.starts_with("\\\\") { 3 } else { 2 };
+    components.saturating_sub(reserved)
+}
+
+/// The path that will actually be excluded: the file itself for scope 0, its
+/// folder for scope 1, that folder's parent for scope 2, and so on.
+///
+/// Folder targets end with a backslash. Defender treats an ASR exclusion
+/// without one as a file name, so `C:\Tools` would not cover `C:\Tools\x.exe`
+/// while `C:\Tools\` does.
+fn exclusion_target(path: &str, scope: usize) -> String {
+    if scope == 0 {
+        return path.to_owned();
+    }
+    let trimmed = path.trim_end_matches(['\\', '/']);
+    let mut end = trimmed.len();
+    for _ in 0..scope {
+        match trimmed[..end].rfind(['\\', '/']) {
+            Some(index) if index > 0 => end = index,
+            _ => break,
+        }
+    }
+    format!("{}\\", &trimmed[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scope_walks_up_but_never_reaches_drive_root() {
+        let path = r"C:\Users\me\Tools\grove\grove.exe";
+        assert_eq!(max_scope(path), 4);
+        assert_eq!(exclusion_target(path, 0), path);
+        assert_eq!(exclusion_target(path, 1), r"C:\Users\me\Tools\grove\");
+        assert_eq!(exclusion_target(path, 4), r"C:\Users\");
+    }
+
+    #[test]
+    fn short_paths_cannot_widen() {
+        assert_eq!(max_scope(r"C:\Scripts\grove.exe"), 1);
+        assert_eq!(exclusion_target(r"C:\Scripts\grove.exe", 1), r"C:\Scripts\");
+        assert_eq!(max_scope(r"C:\grove.exe"), 0);
+    }
+
+    #[test]
+    fn unc_paths_keep_server_and_share() {
+        let path = r"\\server\share\apps\tool.exe";
+        assert_eq!(max_scope(path), 1);
+        assert_eq!(exclusion_target(path, 1), r"\\server\share\apps\");
+    }
+
+    #[test]
+    fn covering_folder_is_found_and_mapped_back_onto_the_path() {
+        let path = r"C:\Users\JURIKR~1\AppData\Local\Programs\grove\grove.exe";
+        let exclusions = vec![
+            normalize_path(r"C:\Other\"),
+            normalize_path(r"C:\Users\JURIKR~1\AppData\Local\Programs\grove\"),
+        ];
+        let entry = matching_exclusion(path, &exclusions).expect("folder should cover the file");
+        let at = covered_prefix_len(path, &entry).expect("prefix should map onto path");
+        assert_eq!(&path[..at], r"C:\Users\JURIKR~1\AppData\Local\Programs\grove\");
+        assert_eq!(&path[at..], "grove.exe");
+    }
+
+    #[test]
+    fn exact_file_exclusion_has_no_folder_prefix() {
+        let path = r"C:\Tools\x.exe";
+        let exclusions = vec![normalize_path(path)];
+        let entry = matching_exclusion(path, &exclusions).unwrap();
+        assert_eq!(covered_prefix_len(path, &entry), None);
+        assert_eq!(matching_exclusion(r"C:\Tools\y.exe", &exclusions), None);
+    }
+
+    #[test]
+    fn folder_targets_end_with_backslash_and_files_do_not() {
+        let path = r"C:\Tools\x.exe";
+        assert!(!exclusion_target(path, 0).ends_with('\\'));
+        assert!(exclusion_target(path, 1).ends_with('\\'));
+    }
 }
