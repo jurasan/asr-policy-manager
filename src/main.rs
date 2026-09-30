@@ -237,6 +237,12 @@ impl App {
 const ELEVATED_FLAG: &str = "--elevated";
 
 fn main() {
+    // Answered before elevation: no UAC prompt just to print the version.
+    if std::env::args().skip(1).any(|arg| arg == "-V" || arg == "--version") {
+        println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     let relaunched = std::env::args().skip(1).any(|arg| arg == ELEVATED_FLAG);
 
     if !elevation::is_elevated() {
